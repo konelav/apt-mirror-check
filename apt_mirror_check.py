@@ -1,12 +1,12 @@
 # coding: utf-8
 
-import click
+import argparse
 import os
 import hashlib
 import re
 import sys
-from pathlib import Path
 
+PBAR_SIZE = 50
 
 class FileAttr(object):
     def __init__(self, path):
@@ -29,8 +29,11 @@ def dist_attrs(dist_dir):
     """ Parse file attributes in Release file """
     attrs = {}
 
-    for release in Path(dist_dir).rglob('Release'):
-        with open(release.as_posix(), "rt") as f:
+    #for release in Path(dist_dir).rglob('Release'):
+    for root, _, files in os.walk(dist_dir):
+        if 'Release' not in files:
+            continue
+        with open(os.path.join(root, 'Release'), "rt") as f:
             in_block = False
             attr_name = ""
 
@@ -101,11 +104,13 @@ def pool_attrs(dist_dir, pool_dir):
     return attrs
 
 
-def is_checksum_correct(filepath, attr):
+def is_checksum_correct(filepath, attr, no_checksum):
     s = os.stat(filepath)
     if attr.size != s.st_size:
         print(filepath, "expected size: {}, but {}".format(attr.size, s.st_size))
         return False
+    if no_checksum:
+        return True
 
     if len(attr.md5sum) != 0:
         m = hashlib.md5()
@@ -132,16 +137,25 @@ def is_checksum_correct(filepath, attr):
     return True
 
 
-def bad_files_in_dir(dirpath, attrs):
+def bad_files_in_dir(dirpath, attrs, no_checksum, progress):
+    if progress:
+        print("%s (total %s file(s))" % (dirpath, len(attrs)))
+    nfile = 0
     for root, _, files in os.walk(dirpath):
         for filename in files:
             filepath = os.path.join(root, filename)
             if filepath in attrs:
-                if not is_checksum_correct(filepath, attrs[filepath]):
+                nfile += 1
+                if progress:
+                    pbar = ("#" * (nfile * PBAR_SIZE // len(attrs)) + ' ' * PBAR_SIZE)[:PBAR_SIZE]
+                    pbar = "%s [%s]" % (nfile, pbar)
+                    sys.stdout.write("%s\r" % pbar)
+                if not is_checksum_correct(filepath, attrs[filepath], no_checksum):
                     yield filepath
+    if progress:
+        print("\n")
 
-
-def bad_files_in_mirror(mirror_dir):
+def bad_files_in_mirror(mirror_dir, no_checksum, pools):
     dist_root = os.path.join(mirror_dir, "dists")
     walker = os.walk(dist_root)
     _, subdirs, _ = next(walker)
@@ -150,9 +164,15 @@ def bad_files_in_mirror(mirror_dir):
     pool_dir = os.path.join(mirror_dir, "pool")
 
     for dist_dir in dist_dirs:
-        click.echo("checking %s ..." % dist_dir)
-        yield from bad_files_in_dir(dist_dir, dist_attrs(dist_dir))
-        yield from bad_files_in_dir(pool_dir, pool_attrs(dist_dir, pool_dir))
+        print("checking %s ..." % dist_dir)
+        for badfile in bad_files_in_dir(dist_dir, dist_attrs(dist_dir), no_checksum, False):
+            yield badfile
+        if pools is None:
+            continue
+        elif not ('*' in pools or any([pool in dist_dir for pool in pools])):
+            continue
+        for badfile in bad_files_in_dir(pool_dir, pool_attrs(dist_dir, pool_dir), no_checksum, True):
+            yield badfile
 
 
 def all_mirrors(sites_dir):
@@ -185,21 +205,34 @@ def get_sites_dir(base_dir):
 
     sites_dir = os.path.join(base_dir, "mirror")  # NOTE: fixed as mirror
     if not os.path.isdir(sites_dir):
-        raise click.BadOptionUsage("--base-dir", "please specify correct base_path the same as /etc/apt/mirror.list")
+        raise Exception("please specify --base-dir as correct base_path the same as /etc/apt/mirror.list")
 
     return sites_dir
 
 
-@click.command("Checking for corrupted files in apt-mirror files")
-@click.option("-b", "--base-dir", type=click.Path(exists=True, file_okay=False, readable=True, resolve_path=True),
-              help="apt-mirror base_path")
-@click.option("--delete/--no-delete", default=False, help="delete corrupted files")
-def cli(base_dir, delete):
+def cli():
+    parser = argparse.ArgumentParser(prog=sys.argv[0],
+        description="Checking for corrupted files in apt-mirror files")
+    parser.add_argument("-b", "--base-dir", type=str, dest="base_dir", default=None,
+        help="apt-mirror base_path")
+    parser.add_argument("--delete", action="store_true", dest="delete",
+        help="delete corrupted files")
+    parser.add_argument("--no-checksum", action="store_true", dest="no_checksum",
+        help="check only sizes of files, do not compute hashsums")
+    parser.add_argument("--pool", type=str, dest="pool", nargs='*', default=None,
+        help="list of substrings to be contained in pool directory path for checking all packages "
+             "(default - do not process packages, '*' - process all packages)")
+    args = parser.parse_args()
+    base_dir = args.base_dir
+    delete = args.delete
+    no_checksum = args.no_checksum
+    pool = args.pool
+
     sites_dir = get_sites_dir(base_dir)
 
     has_bad = False
     for mirror in all_mirrors(sites_dir):
-        for bad_file in bad_files_in_mirror(mirror):
+        for bad_file in bad_files_in_mirror(mirror, no_checksum, pool):
             has_bad = True
 
             if delete:
@@ -207,10 +240,10 @@ def cli(base_dir, delete):
                 prefix = "[DELETED] "
             else:
                 prefix = "[ERROR] "
-            click.secho(prefix + bad_file, color="red")
+            print("\033[91m %s\033[00m" % (prefix + bad_file))
 
     if not has_bad:
-        click.echo("No error found!")
+        print("No error found!")
         sys.exit(0)
     else:
         sys.exit(1)
